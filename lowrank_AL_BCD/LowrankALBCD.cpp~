@@ -2,9 +2,7 @@
 #include <stdlib.h>
 #include <algorithm>
 #include <omp.h>
-#include "LIBSVMFileParser.h"
-#include "Lowrank.h"
-#include "util.h"
+#include "LowrankALBCD.h"
 using namespace std;
 
 double PRIMAL_INF_TOL = 1e-5;
@@ -382,7 +380,7 @@ void runALBCD( vector<SparseVec*>& data, double* exemplar_cost, int N, int D, do
 	
 	//truncate lambda_j to zero since y_j (exemplar indicator)=1 when lambda_j <= 0, 
 	//which then becomes a constant to W.
-	for(int j=0;j<N2;j++)
+	for(int j=0;j<N;j++)
 		exemplar_cost[j] = max(exemplar_cost[j],0.0);
 	
 	//normalize data
@@ -392,10 +390,12 @@ void runALBCD( vector<SparseVec*>& data, double* exemplar_cost, int N, int D, do
 	//construct low rank dissim matrix
 	SparseMat* ones_vec = ones(N,1);
 	int rank = 1;
+	
 	LowrankMat rank_one_11T(ones_vec, ones_vec, rank);
 	rank = D;
 	LowrankMat sim_mat( &data, &data, rank );
 	CompositeLowrankMat dissim_mat(N,N, cache_size);
+	
 	dissim_mat.addMat(2.0, &rank_one_11T);
 	dissim_mat.addMat(-2.0, &sim_mat);
 	
@@ -421,6 +421,8 @@ void py_ALBCDexemplar(double** X, double* exemplar_cost, int N, int D, double et
 	}
 	
 	SparseMat2 WT;
+	Param* param = new Param();
+	
 	runALBCD(data, exemplar_cost, N, D, eta, max_iter, cache_size, WT);
 	
 	//convert WT to W in primary format
@@ -445,45 +447,76 @@ void py_ALBCDexemplar(double** X, double* exemplar_cost, int N, int D, double et
 	}
 }
 
-int main(int argc, char** argv){
-	
-	if( argc < 1+2 ){
-		cerr << "Usage: LowrankALBCD [data] [lambda] (eta) (max_iter) (cache_size) (exemplar_cost)" << endl;
-		exit(0);
+void exit_with_help(){
+
+	cerr << "Usage: LowrankALBCD [data]" << endl;
+	cerr << "output: clusters" << endl;
+	cerr << "	-l lambda: parameter controling number of clusters (default #samples/20)" << endl;
+	cerr << "	-t tightening: incrementally rounding to integer solution (0 or 1, default 0)" << endl;
+	cerr << "	-e eta: Augmented Lagrangian parameter (default 0.01)" << endl;
+	cerr << "	-m max_iter: maximum number of iterations (default 10000)" << endl;
+	cerr << "	-c cache_size: maximum number of columns of dissimilarity matrix stored (default 10000)" << endl;
+	cerr << "	(p.s. Normalized square Euclidean distance d(xi,xj)=2-<xi,xj> is used by default.)" << endl;
+	exit(0);
+}
+
+void parse_cmd_line(int argc, char** argv, Param* param){
+
+	int i;
+	for(i=1;i<argc;i++){
+		if( argv[i][0] != '-' )
+			break;
+		if( ++i >= argc )
+			exit_with_help();
+
+		switch(argv[i-1][1]){
+			
+			case 'l': param->lambda = atof(argv[i]);
+				  break;
+			case 't': param->do_tightening = atoi(argv[i]);
+				  break;
+			case 'e': param->eta = atof(argv[i]);
+				  break;
+			case 'm': param->max_iter = atoi(argv[i]);
+				  break;
+			case 'c': param->cache_size = atoi(argv[i]);
+				  break;
+			default:
+				  cerr << "unknown option: -" << argv[i-1][1] << endl;
+				  exit(0);
+		}
 	}
 	
+	if(i>=argc)
+		exit_with_help();
+	
+	param->dataFile = argv[i++];
+}
+
+int main(int argc, char** argv){
+	
+	if( argc < 1+1 )
+		exit_with_help();
+	
 	// parse arguments
-	char* dataFile = argv[1];
-	double lambda = atof(argv[2]);
-	double eta = 1.0;
-	int max_iter = 1000;
-	int cache_size = 1000;
-	char* exemplar_cost_file = NULL;
-	if( argc >= 1+3 )
-		eta = atof(argv[3]);
-	if( argc >= 1+4 )
-		max_iter = atoi(argv[4]);
-	if( argc >= 1+5 )
-		cache_size = atoi(argv[5]);
-	
-	exemplar_cost_file = NULL;
-	if( argc >= 1+6 )
-		exemplar_cost_file = argv[6];
-	
-	//srand(1);
+	Param* param = new Param();
+	parse_cmd_line(argc,argv, param);
+
 	srand(time(NULL));
 	//read data (libsvm format)
 	int D = -1;
 	int N;
 	vector<SparseVec*> data;
 	vector<int> labels;
-	LIBSVMFileParser::parseSVM(dataFile, D, data, labels);
+	LIBSVMFileParser::parseSVM(param->dataFile, D, data, labels);
 	D += 1;//adding bias, feature started at index 1
 	N = data.size();
-	cerr << "D=" << D << ", N=" << N << ", lambda=" << lambda << endl;
+	if( param->lambda < 0 )
+		param->lambda = N/20.0;
+	cerr << "D=" << D << ", N=" << N << ", lambda=" << param->lambda << endl;
 	double* exemplar_cost = new double[N];
-	if( exemplar_cost_file != NULL ){
-		ifstream fin(exemplar_cost_file);
+	if( param->exemplar_cost_file != NULL ){
+		ifstream fin(param->exemplar_cost_file);
 		readVec(fin, exemplar_cost, N);
 		fin.close();
 	}else{
@@ -491,11 +524,11 @@ int main(int argc, char** argv){
 			exemplar_cost[i] = 0.0;
 	}
 	for(int i=0;i<N;i++)
-		exemplar_cost[i] += lambda;
-
+		exemplar_cost[i] += param->lambda;
+	
 	SparseMat2 WT;
-	runALBCD(data, exemplar_cost, N, D, eta, max_iter, cache_size, WT);
-
+	runALBCD(data, exemplar_cost, N, D, param->eta, param->max_iter, param->cache_size, WT);
+	
 	ofstream fout("clusters");
 	printSparseMat(WT, fout);
 	fout.close();
